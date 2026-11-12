@@ -41,10 +41,10 @@ pack .exportUI.sep11 -fill x -padx 10 -pady 10
 
 frame .exportUI.frmSet
 pack .exportUI.frmSet -pady 5
-label .exportUI.frmSet.lbl -text "Elements Selection Format:\n'all' -> All elements\n'1-100' -> Element ID range\n'id 5' -> Element ID 5\n'selectionset == 5' -> User Set ID 5\n'component == Part1' -> Component name" -justify left
+label .exportUI.frmSet.lbl -text "Select Elements by:\n  - all            : All elements\n  - Mesh / 1001    : Set Name or ID\n  - Part1          : Component name\n  - comp 1-10      : Component IDs\n  - 1-100          : Element IDs" -justify left
 pack .exportUI.frmSet.lbl -side left -padx 10
 entry .exportUI.frmSet.ent -textvariable ::user_elem_sel -width 25
-set ::user_elem_sel "selectionset == 5"
+set ::user_elem_sel "Mesh"
 pack .exportUI.frmSet.ent -side left -padx 5
 
 # --- Part 1: Displacement Extreme Exporter ---
@@ -168,9 +168,12 @@ proc SafeRF {allowable stress} {
     if {$stress eq ""} {return "N/A"}
     if {![string is double -strict $allowable]} {return "N/A"}
     if {![string is double -strict $stress]} {return "N/A"}
-    if {$stress == 0} {return "N/A"}
+    if {$stress == 0 || abs($stress) < 1e-12} {return "> 2"}
     set rf_val [expr {abs($allowable / $stress)}]
-    return [FormatNumber $rf_val 3]
+    if {$rf_val > 2.0} {
+        return "> 2"
+    }
+    return [FormatNumber $rf_val 2]
 }
 
 
@@ -182,9 +185,13 @@ proc GetExtreme {maxval minval} {
     }
 }
 
-proc FormatNumber {value {decimals 3}} {
+proc FormatNumber {value {decimals 2}} {
     if {$value == "" || ![string is double -strict $value]} {
         return "N/A"
+    }
+    # Avoid negative zero (-0,00)
+    if {abs($value) < [expr {pow(10, -$decimals) / 2.0}]} {
+        set value 0.0
     }
     set formatted [format "%.${decimals}f" $value]
     return [string map { "." "," } $formatted]
@@ -329,6 +336,160 @@ proc ExportDisplacement {} {
 
 
 # -----------------------------------------------------------------
+# Helper: Resolve and apply element selection (supports ID ranges,
+# components, wildcards like Plaque*, comma-separated lists,
+# User Sets, and Model/Solver Sets by ID or Name)
+# -----------------------------------------------------------------
+proc ApplySingleElementSelection {mod_h elem_set_h sel_str} {
+    set sel_str [string trim $sel_str]
+    if {$sel_str eq ""} return
+
+    # 1. Try direct HyperView syntax first
+    if {![catch {eval "$elem_set_h Add \"$sel_str\""}]} {
+        if {[$elem_set_h GetSize] > 0} return
+    }
+
+    # 2. Try direct component name: "component == $sel_str"
+    if {![catch {eval "$elem_set_h Add \"component == $sel_str\""}]} {
+        if {[$elem_set_h GetSize] > 0} return
+    }
+
+    # 2b. Try "comp 1-10" or "component 1-10"
+    if {[regexp -nocase {^comp(?:onent)?\s+(.+)$} $sel_str -> comp_args]} {
+        if {![catch {eval "$elem_set_h Add \"component $comp_args\""}]} {
+            if {[$elem_set_h GetSize] > 0} return
+        }
+    }
+
+    # 3. Check for wildcard pattern in component names (e.g. "Plaque*" or "*body*")
+    if {[string match "*\\**" $sel_str] || [string match "*\\?*" $sel_str]} {
+        catch {
+            set temp_cid [$mod_h AddSelectionSet component]
+            $mod_h GetSelectionSetHandle temp_csh $temp_cid
+            $temp_csh Add all
+            set all_cids [$temp_csh GetList]
+            $temp_csh ReleaseHandle
+            $mod_h RemoveSelectionSet $temp_cid
+
+            foreach cid $all_cids {
+                catch {
+                    $mod_h GetComponentHandle compH $cid
+                    set cname [$compH GetLabel]
+                    $compH ReleaseHandle
+                    if {[string match -nocase $sel_str $cname]} {
+                        catch {$elem_set_h Add "component $cid"}
+                    }
+                }
+            }
+        }
+        if {[$elem_set_h GetSize] > 0} return
+    }
+
+    # 4. Search Set by ID or Name (Model Sets and User Sets)
+    set target $sel_str
+    if {[regexp -nocase {(?:selectionset|set)\s*(?:==|\s)\s*(.+)} $sel_str -> match]} {
+        set target [string trim $match " '\""]
+    }
+
+    set pools [list "" "set" "User_Set" "Model" "model"]
+    catch {
+        foreach t {set element node component model group} {
+            catch {
+                foreach p [$mod_h GetPoolList $t] {
+                    if {[lsearch -exact $pools $p] == -1} {
+                        lappend pools $p
+                    }
+                }
+            }
+        }
+    }
+
+    set found_elems [list]
+    set matched_sid ""
+
+    foreach p $pools {
+        set sset_ids [list]
+        if {$p eq ""} {
+            catch {set sset_ids [$mod_h GetSelectionSetList]}
+        } else {
+            catch {set sset_ids [$mod_h GetSelectionSetList $p]}
+        }
+
+        foreach sid $sset_ids {
+            catch {
+                set sh ""
+                if {$p eq ""} {
+                    $mod_h GetSelectionSetHandle sh $sid
+                } else {
+                    $mod_h GetSelectionSetHandle sh "$p $sid"
+                }
+
+                set s_id [$sh GetID]
+                set s_label [$sh GetLabel]
+
+                if {[string equal -nocase $target $s_id] || \
+                    [string equal -nocase $target $s_label] || \
+                    [string equal -nocase "Set $target" $s_label] || \
+                    ([string match "*\\**" $target] && [string match -nocase $target $s_label])} {
+                    set matched_sid $sid
+                    set found_elems [$sh GetList]
+                }
+                $sh ReleaseHandle
+            }
+            if {[llength $found_elems] > 0} { break }
+        }
+        if {[llength $found_elems] > 0} { break }
+    }
+
+    if {$matched_sid ne "" || [llength $found_elems] > 0} {
+        if {$matched_sid ne ""} {
+            catch {$elem_set_h Add "selectionset == $matched_sid"}
+        }
+        if {[$elem_set_h GetSize] == 0 && [llength $found_elems] > 0} {
+            set chunk_sz 300
+            for {set i 0} {$i < [llength $found_elems]} {incr i $chunk_sz} {
+                set chunk [lrange $found_elems $i [expr {$i + $chunk_sz - 1}]]
+                if {[catch {$elem_set_h Add "id $chunk"}]} {
+                    catch {$elem_set_h Add idlist [join $chunk ,]}
+                }
+            }
+        }
+        if {[$elem_set_h GetSize] > 0} return
+    }
+
+    # 5. Numeric ID or range fallback (e.g. "1-100" -> "id 1-100")
+    if {[regexp {^[0-9]+(-[0-9]+)?$} $sel_str]} {
+        catch {$elem_set_h Add "id $sel_str"}
+        if {[$elem_set_h GetSize] > 0} return
+    }
+}
+
+proc ApplyElementSelection {mod_h elem_set_h sel_str} {
+    set sel_str [string trim $sel_str]
+    if {$sel_str eq ""} { set sel_str "all" }
+
+    # Handle comma-separated list of items (e.g. "comp1, comp2, 1001")
+    if {[string match "*,*" $sel_str]} {
+        set items [split $sel_str ","]
+        foreach itm $items {
+            set itm [string trim $itm]
+            if {$itm ne ""} {
+                ApplySingleElementSelection $mod_h $elem_set_h $itm
+            }
+        }
+        if {[$elem_set_h GetSize] > 0} { return }
+    } else {
+        ApplySingleElementSelection $mod_h $elem_set_h $sel_str
+        if {[$elem_set_h GetSize] > 0} { return }
+    }
+
+    # Fallback to all if nothing matched
+    if {[$elem_set_h GetSize] == 0} {
+        catch {$elem_set_h Add all}
+    }
+}
+
+# -----------------------------------------------------------------
 # 3. New Procedure: Export EXTREME Stresses per Subcase for Selection
 # -----------------------------------------------------------------
 proc ExportStressForSet {} {
@@ -352,11 +513,8 @@ proc ExportStressForSet {} {
     set sel_id [mod AddSelectionSet element]
     mod GetSelectionSetHandle elem_set $sel_id
    
-    # Evaluate selection safely
-    if {[catch {eval "elem_set Add \"$user_elem_sel\""}]} {
-        tk_messageBox -message "Invalid selection: '$user_elem_sel'. Exporting 'all'. Make sure to use syntax like 'selectionset == 5'." -parent .exportUI
-        elem_set Add all
-    }
+    # Safely resolve and apply selection
+    ApplyElementSelection mod elem_set $user_elem_sel
     
     set num_elems [elem_set GetSize]
 
@@ -533,11 +691,8 @@ proc ExportFailureIndexForSet {} {
     set sel_id [mod AddSelectionSet element]
     mod GetSelectionSetHandle elem_set $sel_id
 
-    # Evaluate selection safely
-    if {[catch {eval "elem_set Add \"$user_elem_sel\""}]} {
-        tk_messageBox -message "Invalid selection: '$user_elem_sel'. Exporting 'all'." -parent .exportUI
-        elem_set Add all
-    }
+    # Safely resolve and apply selection
+    ApplyElementSelection mod elem_set $user_elem_sel
 
     set num_elems [elem_set GetSize]
     if {$num_elems == 0} {
@@ -617,11 +772,16 @@ proc ExportFailureIndexForSet {} {
 
         # Format for CSV and Calculate RF
         if {$max_fi != ""} { 
-            set str_fi [FormatNumber $max_fi 4] 
+            set str_fi [FormatNumber $max_fi 2] 
             if {$max_fi > 0} {
-                set str_rf [FormatNumber [expr {1.0 / sqrt($max_fi)}] 3]
+                set rf_val [expr {1.0 / sqrt($max_fi)}]
+                if {$rf_val > 2.0} {
+                    set str_rf "> 2"
+                } else {
+                    set str_rf [FormatNumber $rf_val 2]
+                }
             } else {
-                set str_rf "N/A"
+                set str_rf "> 2"
             }
         } else { 
             set str_fi "N/A"
@@ -665,11 +825,8 @@ proc ExportInterLaminarStressForSet {} {
     set sel_id [mod AddSelectionSet element]
     mod GetSelectionSetHandle elem_set $sel_id
 
-    # Evaluate selection safely
-    if {[catch {eval "elem_set Add \"$user_elem_sel\""}]} {
-        tk_messageBox -message "Invalid selection: '$user_elem_sel'. Exporting 'all'." -parent .exportUI
-        elem_set Add all
-    }
+    # Safely resolve and apply selection
+    ApplyElementSelection mod elem_set $user_elem_sel
 
     set num_elems [elem_set GetSize]
     if {$num_elems == 0} {
@@ -767,10 +924,10 @@ proc ExportInterLaminarStressForSet {} {
         if {$min_xz != ""} { if {$g_min_xz == "" || $min_xz < $g_min_xz} { set g_min_xz $min_xz } }
 
         # Format for CSV
-        if {$max_yz != ""} { set str_max_yz [FormatNumber $max_yz 3] } else { set str_max_yz "N/A" }
-        if {$min_yz != ""} { set str_min_yz [FormatNumber $min_yz 3] } else { set str_min_yz "N/A" }
-        if {$max_xz != ""} { set str_max_xz [FormatNumber $max_xz 3] } else { set str_max_xz "N/A" }
-        if {$min_xz != ""} { set str_min_xz [FormatNumber $min_xz 3] } else { set str_min_xz "N/A" }
+        if {$max_yz != ""} { set str_max_yz [FormatNumber $max_yz 2] } else { set str_max_yz "N/A" }
+        if {$min_yz != ""} { set str_min_yz [FormatNumber $min_yz 2] } else { set str_min_yz "N/A" }
+        if {$max_xz != ""} { set str_max_xz [FormatNumber $max_xz 2] } else { set str_max_xz "N/A" }
+        if {$min_xz != ""} { set str_min_xz [FormatNumber $min_xz 2] } else { set str_min_xz "N/A" }
         
         # OUTPUT ORDER
         puts $fp "$sub;$safe_sub_name;$str_max_xz;$str_max_yz;$str_min_xz;$str_min_yz"
@@ -808,11 +965,8 @@ proc ExportStressExtremeLayer {} {
     set sel_id [mod AddSelectionSet element]
     mod GetSelectionSetHandle elem_set $sel_id
 
-    # Evaluate selection safely
-    if {[catch {eval "elem_set Add \"$user_elem_sel\""}]} {
-        tk_messageBox -message "Invalid selection: '$user_elem_sel'. Exporting 'all'." -parent .exportUI
-        elem_set Add all
-    }
+    # Safely resolve and apply selection
+    ApplyElementSelection mod elem_set $user_elem_sel
 
     set num_elems [elem_set GetSize]
     if {$num_elems == 0} {
@@ -931,8 +1085,8 @@ proc ExportStressExtremeLayer {} {
                 if {$c_min != ""} { if {$g_min_yz == "" || $c_min < $g_min_yz} { set g_min_yz $c_min } }
             }
 
-            set str_max [expr {$c_max != "" ? [FormatNumber $c_max 3] : "N/A"}]
-            set str_min [expr {$c_min != "" ? [FormatNumber $c_min 3] : "N/A"}]
+            set str_max [expr {$c_max != "" ? [FormatNumber $c_max 2] : "N/A"}]
+            set str_min [expr {$c_min != "" ? [FormatNumber $c_min 2] : "N/A"}]
 
             # RF rules requested by user
             set rf_max [SafeRF $Ftu $c_max]
@@ -956,18 +1110,18 @@ proc ExportStressExtremeLayer {} {
 
     # Summary Row Format
 
-    set g_str_max_xx [expr {$g_max_xx != "" ? [FormatNumber $g_max_xx 3] : "N/A"}]
-    set g_str_min_xx [expr {$g_min_xx != "" ? [FormatNumber $g_min_xx 3] : "N/A"}]
-    set g_str_max_yy [expr {$g_max_yy != "" ? [FormatNumber $g_max_yy 3] : "N/A"}]
-    set g_str_min_yy [expr {$g_min_yy != "" ? [FormatNumber $g_min_yy 3] : "N/A"}]
-    set g_str_max_zz [expr {$g_max_zz != "" ? [FormatNumber $g_max_zz 3] : "N/A"}]
-    set g_str_min_zz [expr {$g_min_zz != "" ? [FormatNumber $g_min_zz 3] : "N/A"}]
-    set g_str_max_xy [expr {$g_max_xy != "" ? [FormatNumber $g_max_xy 3] : "N/A"}]
-    set g_str_min_xy [expr {$g_min_xy != "" ? [FormatNumber $g_min_xy 3] : "N/A"}]
-    set g_str_max_zx [expr {$g_max_zx != "" ? [FormatNumber $g_max_zx 3] : "N/A"}]
-    set g_str_min_zx [expr {$g_min_zx != "" ? [FormatNumber $g_min_zx 3] : "N/A"}]
-    set g_str_max_yz [expr {$g_max_yz != "" ? [FormatNumber $g_max_yz 3] : "N/A"}]
-    set g_str_min_yz [expr {$g_min_yz != "" ? [FormatNumber $g_min_yz 3] : "N/A"}]
+    set g_str_max_xx [expr {$g_max_xx != "" ? [FormatNumber $g_max_xx 2] : "N/A"}]
+    set g_str_min_xx [expr {$g_min_xx != "" ? [FormatNumber $g_min_xx 2] : "N/A"}]
+    set g_str_max_yy [expr {$g_max_yy != "" ? [FormatNumber $g_max_yy 2] : "N/A"}]
+    set g_str_min_yy [expr {$g_min_yy != "" ? [FormatNumber $g_min_yy 2] : "N/A"}]
+    set g_str_max_zz [expr {$g_max_zz != "" ? [FormatNumber $g_max_zz 2] : "N/A"}]
+    set g_str_min_zz [expr {$g_min_zz != "" ? [FormatNumber $g_min_zz 2] : "N/A"}]
+    set g_str_max_xy [expr {$g_max_xy != "" ? [FormatNumber $g_max_xy 2] : "N/A"}]
+    set g_str_min_xy [expr {$g_min_xy != "" ? [FormatNumber $g_min_xy 2] : "N/A"}]
+    set g_str_max_zx [expr {$g_max_zx != "" ? [FormatNumber $g_max_zx 2] : "N/A"}]
+    set g_str_min_zx [expr {$g_min_zx != "" ? [FormatNumber $g_min_zx 2] : "N/A"}]
+    set g_str_max_yz [expr {$g_max_yz != "" ? [FormatNumber $g_max_yz 2] : "N/A"}]
+    set g_str_min_yz [expr {$g_min_yz != "" ? [FormatNumber $g_min_yz 2] : "N/A"}]
 
     set rf_g_max_xx [SafeRF $Ftu $g_max_xx]
     set rf_g_max_yy [SafeRF $Ftu $g_max_yy]
@@ -1014,11 +1168,8 @@ proc ExportStressExtremeLayerZXYZ {} {
     set sel_id [mod AddSelectionSet element]
     mod GetSelectionSetHandle elem_set $sel_id
 
-    # Evaluate selection safely
-    if {[catch {eval "elem_set Add \"$user_elem_sel\""}]} {
-        tk_messageBox -message "Invalid selection: '$user_elem_sel'. Exporting 'all'." -parent .exportUI
-        elem_set Add all
-    }
+    # Safely resolve and apply selection
+    ApplyElementSelection mod elem_set $user_elem_sel
 
     set num_elems [elem_set GetSize]
     if {$num_elems == 0} {
@@ -1117,8 +1268,8 @@ proc ExportStressExtremeLayerZXYZ {} {
             }
 
             # Local string format (Using FormatNumber for French comma)
-            set str_max [expr {$c_max != "" ? [FormatNumber $c_max 3] : "N/A"}]
-            set str_min [expr {$c_min != "" ? [FormatNumber $c_min 3] : "N/A"}]
+            set str_max [expr {$c_max != "" ? [FormatNumber $c_max 2] : "N/A"}]
+            set str_min [expr {$c_min != "" ? [FormatNumber $c_min 2] : "N/A"}]
 
             # RF Calculations
             if {$i == 0} {
@@ -1171,11 +1322,8 @@ proc ExportFastenerForces {} {
     set sel_id [mod AddSelectionSet element]
     mod GetSelectionSetHandle elem_set $sel_id
 
-    # Evaluate selection safely
-    if {[catch {eval "elem_set Add \"$user_elem_sel\""}]} {
-        tk_messageBox -message "Invalid selection: '$user_elem_sel'. Exporting 'all'." -parent .exportUI
-        elem_set Add all
-    }
+    # Safely resolve and apply selection
+    ApplyElementSelection mod elem_set $user_elem_sel
 
     set num_elems [elem_set GetSize]
     if {$num_elems == 0} {
@@ -1314,10 +1462,11 @@ proc ShowHelp {} {
     append instructions "HYPERVIEW\n\n"
     append instructions "1. Load your model and all result files in HyperView.\n\n"
     append instructions "2. Selection Format:\n"
-    append instructions "   - all: Selects all elements\n"
-    append instructions "   - 1-100: Selects element ID range\n"
-    append instructions "   - id 5: Selects element ID 5\n"
-    append instructions "   - selectionset == 5: Selects User Set ID 5\n\n"
+    append instructions "   - all            : All elements in model\n"
+    append instructions "   - Mesh or 1001   : Set Name or Set ID\n"
+    append instructions "   - Part1          : Component name\n"
+    append instructions "   - comp 1-10      : Component ID range\n"
+    append instructions "   - 1-100 or id 5  : Element IDs\n\n"
     append instructions "3. Enter your allowable values (Fsu, Fcu, Ftu, etc.) for Reserve Factor (RF) calculations.\n\n"
     append instructions "4. Click the export button for the specific data you want to retrieve. The script will iterate through all subcases automatically and export data into CSV file.\n"
     
