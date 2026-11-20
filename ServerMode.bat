@@ -283,6 +283,21 @@ if ($biosWolOk) {
     Print-Status -Criteria "9. BIOS Wake-on-LAN (Nhan lenh bat may khi da tat)" -Status "CHUA_OK" -Note $biosWolNote
 }
 
+# 10. Cau hinh Tailscale chay ngam (Unattended Mode - khong ngat ket noi khi logout / man hinh khoa)
+$tsCmd = Get-Command "tailscale" -ErrorAction SilentlyContinue
+$tsExe = if ($tsCmd) { $tsCmd.Source } elseif (Test-Path "${env:ProgramFiles}\Tailscale\tailscale.exe") { "${env:ProgramFiles}\Tailscale\tailscale.exe" } else { $null }
+
+if ($tsExe) {
+    $tsOut = & $tsExe set --unattended 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        Print-Status -Criteria "10. Tailscale Unattended Mode (Duy tri ket noi khi logout/lock)" -Status "OK"
+    } else {
+        Print-Status -Criteria "10. Tailscale Unattended Mode" -Status "FAIL" -Note "$tsOut"
+    }
+} else {
+    Print-Status -Criteria "10. Tailscale Unattended Mode" -Status "CHUA_OK" -Note "Khong tim thay Tailscale da cai dat tren he thong"
+}
+
 Write-Host "=====================================================" -ForegroundColor Cyan
 Write-Host "THONG TIN DE BAT MAY TU XA BANG DIEN THOAI:" -ForegroundColor Yellow
 foreach ($t in $wolTargets) {
